@@ -10,6 +10,7 @@ Each app keeps its own database, its own `Base`, its own routers. This package s
 - `GUID` / `UTCDateTime` — SQLAlchemy column types. `GUID` matches fastapi-users' own UUID serialization (dashed, not `.hex`) so a join between your tables and `user` doesn't silently return zero rows; `UTCDateTime` re-attaches the UTC offset SQLite drops, so timestamps don't get read as local time by the browser
 - `build_auth(...)` — wires cookie-session auth (fastapi-users, DB-backed strategy) plus a self-locking first-run setup wizard
 - `SecretBox` — Fernet encryption for secrets an app stores in its own DB (e.g. an Immich API key)
+- `OAuthUserMixin` / `OAuthAccountMixin` / `OIDCSettings` — "log in with Authentik" alongside local password login (needs the `oidc` extra: `pip install "wk-auth[oidc]"`)
 
 ## Wiring it into an app
 
@@ -44,11 +45,43 @@ router = APIRouter(dependencies=[Depends(auth.require_admin)])
 
 Run `alembic revision --autogenerate` after adding the mixins — the tables live in your app's own migrations, this package owns no schema of its own.
 
+## Adding "log in with Authentik"
+
+```python
+from wk_auth import AuthSettings, OAuthUserMixin, OAuthAccountMixin, OIDCSettings, build_auth
+
+class User(OAuthUserMixin, Base):     # instead of UserMixin
+    pass
+
+class OAuthAccount(OAuthAccountMixin, Base):  # name must be exactly this
+    pass
+
+auth = build_auth(
+    user_model=User,
+    access_token_model=AccessToken,
+    get_async_session=get_async_session,
+    settings=AuthSettings(secret_key=settings.secret_key, cookie_name="birdex_session"),
+    oauth_account_model=OAuthAccount,
+    oidc=OIDCSettings(
+        client_id=...,      # from Authentik's Provider config
+        client_secret=...,
+        discovery_url="https://auth.w-k.io/application/o/<app-slug>/.well-known/openid-configuration",
+    ),
+)
+auth.include_routers(app)  # + mounts /api/auth/authentik/{authorize,callback}
+```
+
+Local login is never at the IdP's mercy: `OpenID.__init__` (httpx-oauth's own class, not something wired around here) does its discovery call **synchronously at construction time** — if that fails, `build_auth()` logs a warning and returns with `auth.oidc_router is None`, and the rest of the app — including local password login and the setup wizard — boots exactly as if `oidc=` had been omitted. There's no retry; the next process restart tries discovery again. `tests/test_oidc.py` asserts this directly (an unreachable IdP still lets local login work end to end).
+
+A successful Authentik login is linked to an existing local account by e-mail match (`associate_by_email=True`, not exposed as configurable — see `OIDCSettings`' docstring for why that's safe specifically for a self-hosted, operator-provisioned IdP with no public registration, and stops being safe the moment that changes).
+
+Full walkthrough for standing up Authentik itself, including the per-app Provider/Application recipe: see `../homelab-authentik/SETUP.md`.
+
 ## What this does *not* do (yet)
 
-Single sign-on. Two apps using this package each run their own independent login — same code, same cookie shape, but signing into one does not sign you into the other, because `cookie_domain` defaults to the current host and each app keeps its own `user`/`access_tokens` rows.
+True single sign-on *between apps that don't share an IdP login*. Once every app is wired to the same Authentik instance (above), signing into Authentik once and visiting a second app still requires that app's own `/authorize` round trip — Authentik itself remembers the browser is already authenticated and skips re-prompting for a password, but each app still gets its own local session cookie via its own callback. That's normal OIDC behaviour, not a gap here.
 
-The path to real SSO is OIDC: point every app at a shared identity provider (Authentik) instead of having them check passwords against their own tables. `build_auth()`'s local login stays in place as a fallback for when the IdP is unreachable, which is also why the first-run setup wizard exists independent of any IdP.
+What's still genuinely missing: apps don't share a session *cookie* — `cookie_domain` defaults to the current host, and each app keeps its own `user`/`access_tokens` rows regardless of whether OIDC is wired up, linked by e-mail rather than by a shared user table.
 
 ## Local development
 

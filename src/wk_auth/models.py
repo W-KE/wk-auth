@@ -17,9 +17,10 @@ from __future__ import annotations
 import enum
 
 from fastapi_users.db import SQLAlchemyBaseUserTableUUID
+from fastapi_users_db_sqlalchemy import SQLAlchemyBaseOAuthAccountTableUUID
 from fastapi_users_db_sqlalchemy.access_token import SQLAlchemyBaseAccessTokenTableUUID
 from sqlalchemy import Enum
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, declared_attr, mapped_column, relationship
 
 
 class Role(str, enum.Enum):
@@ -58,3 +59,34 @@ class AccessTokenMixin(SQLAlchemyBaseAccessTokenTableUUID):
     """
 
     __tablename__ = "access_tokens"
+
+
+class OAuthAccountMixin(SQLAlchemyBaseOAuthAccountTableUUID):
+    """One linked external identity (an Authentik/OIDC login) per row.
+
+    Only needed by apps that pass ``oidc=`` to :func:`build_auth`. The
+    concrete class an app defines from this **must** be named
+    ``OAuthAccount`` — :class:`OAuthUserMixin` below refers to it by that
+    string, which SQLAlchemy resolves against the shared declarative
+    registry at mapper-configuration time, not at import time.
+    """
+
+    __tablename__ = "oauth_account"
+
+
+class OAuthUserMixin(UserMixin):
+    """``UserMixin`` plus the relationship fastapi-users needs to attach
+    OAuth identities to a user (``user.oauth_accounts.append(...)`` in its
+    own ``add_oauth_account``).
+
+    A separate mixin rather than putting this on ``UserMixin`` itself: an
+    unconditional ``relationship("OAuthAccount", ...)`` there would fail to
+    resolve for every app that doesn't define an ``OAuthAccount`` class —
+    which is most of them, since local password login works without OIDC.
+    Only an app that calls ``build_auth(..., oidc=OIDCSettings(...))`` needs
+    this instead of plain ``UserMixin``.
+    """
+
+    @declared_attr
+    def oauth_accounts(cls) -> Mapped[list["OAuthAccountMixin"]]:
+        return relationship("OAuthAccount", lazy="joined")

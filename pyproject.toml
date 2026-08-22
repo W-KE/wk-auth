@@ -12,12 +12,19 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Only apps that pass oidc= to build_auth() need this — kept out of the
+# base install so the many apps that only want local password login don't
+# pull in httpx-oauth.
+oidc = [
+    "fastapi-users[oauth]>=13.0",
+]
 dev = [
     "pytest>=8.3",
     "pytest-asyncio>=0.24",
     "httpx>=0.27",
     "aiosqlite>=0.20",
     "asgi-lifespan>=2.1",
+    "wk-auth[oidc]",
 ]
 
 [tool.setuptools.packages.find]

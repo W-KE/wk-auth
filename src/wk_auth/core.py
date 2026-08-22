@@ -16,6 +16,7 @@ and then uses `auth.current_active_user`, `auth.require_admin`, and
 """
 from __future__ import annotations
 
+import logging
 import uuid
 from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass
@@ -30,12 +31,19 @@ from fastapi_users_db_sqlalchemy.access_token import SQLAlchemyAccessTokenDataba
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from wk_auth.config import AuthSettings
+from wk_auth.config import AuthSettings, OIDCSettings
 from wk_auth.models import Role
 from wk_auth.schemas import SetupStatus, UserCreate, UserRead, UserUpdate
 from wk_auth.secrets import SecretBox
 
 SessionDependency = Callable[..., AsyncGenerator[AsyncSession, None]]
+
+# The name embedded in fastapi-users' route names (oauth:{name}.{backend}.*)
+# and in the mount path (see include_routers). Fixed rather than
+# configurable: this package talks to exactly one kind of IdP.
+OIDC_PROVIDER_NAME = "authentik"
+
+_logger = logging.getLogger("wk_auth")
 
 
 @dataclass
@@ -51,6 +59,11 @@ class Auth:
     current_active_user: Callable
     secrets: SecretBox
     setup_router: APIRouter
+    # None when no `oidc=` was passed to build_auth(), *or* when it was
+    # passed but discovery against the IdP failed at startup — see
+    # build_auth()'s docstring. Either way, local password login is
+    # unaffected; only SSO is unavailable.
+    oidc_router: APIRouter | None = None
 
     def require_role(self, role: Role) -> Callable:
         """Dependency asserting the signed-in user holds `role`.
@@ -103,6 +116,13 @@ class Auth:
             prefix=f"{prefix}/users",
             tags=["users"],
         )
+        if self.oidc_router is not None:
+            # -> {prefix}/auth/authentik/authorize, {prefix}/auth/authentik/callback
+            app.include_router(
+                self.oidc_router,
+                prefix=f"{prefix}/auth/{OIDC_PROVIDER_NAME}",
+                tags=["auth"],
+            )
 
 
 def _build_setup_router(
@@ -155,11 +175,34 @@ def build_auth(
     get_async_session: SessionDependency,
     settings: AuthSettings,
     api_prefix: str = "/api",
+    oauth_account_model: type | None = None,
+    oidc: OIDCSettings | None = None,
 ) -> Auth:
+    """Build an app's full auth stack.
+
+    Pass `oidc=` (with `oauth_account_model=` — the app's own
+    `OAuthAccount` class, built from `OAuthUserMixin` on its `User`) to add
+    "log in with Authentik" alongside local password login. Local login
+    never depends on it: if the IdP can't be reached when this function
+    runs — which for most apps is once, at process startup — a warning is
+    logged, `Auth.oidc_router` comes back `None`, and the app boots and
+    serves local logins exactly as if `oidc` had been omitted. There is no
+    retry; a later restart will attempt discovery again.
+
+    That degrade-don't-block behaviour exists because OpenID Connect
+    discovery is a **synchronous network call made by `OpenID.__init__`
+    itself** (httpx-oauth's own design, not something this function can
+    defer) — done naively, a moment of the IdP being unreachable would take
+    the whole app down with it, including the local login this exists to
+    keep as a fallback.
+    """
+    if oidc is not None and oauth_account_model is None:
+        raise ValueError("build_auth(oidc=...) also requires oauth_account_model")
+
     async def get_user_db(
         session: AsyncSession = Depends(get_async_session),
     ) -> AsyncGenerator[Any, None]:
-        yield SQLAlchemyUserDatabase(session, user_model)
+        yield SQLAlchemyUserDatabase(session, user_model, oauth_account_model)
 
     async def get_access_token_db(
         session: AsyncSession = Depends(get_async_session),
@@ -196,6 +239,15 @@ def build_auth(
         get_user_manager, [backend]
     )
 
+    oidc_router = None
+    if oidc is not None:
+        oidc_router = _build_oidc_router(
+            oidc=oidc,
+            backend=backend,
+            fastapi_users=fastapi_users,
+            state_secret=settings.secret_key,
+        )
+
     return Auth(
         settings=settings,
         user_model=user_model,
@@ -211,4 +263,51 @@ def build_auth(
             get_user_manager=get_user_manager,
             prefix=api_prefix,
         ),
+        oidc_router=oidc_router,
+    )
+
+
+def _build_oidc_router(
+    *,
+    oidc: OIDCSettings,
+    backend: AuthenticationBackend,
+    fastapi_users: FastAPIUsers,
+    state_secret: str,
+) -> APIRouter | None:
+    """Discover the IdP and build its router — or, on any failure, log a
+    warning and return None. See build_auth()'s docstring for why a
+    failure here must not raise.
+    """
+    try:
+        from httpx_oauth.clients.openid import OpenID
+    except ImportError as exc:  # pragma: no cover - exercised by packaging, not logic
+        raise ImportError(
+            "build_auth(oidc=...) requires the 'oidc' extra: "
+            'pip install "wk-auth[oidc]"'
+        ) from exc
+
+    try:
+        client = OpenID(
+            oidc.client_id, oidc.client_secret, oidc.discovery_url, name=OIDC_PROVIDER_NAME
+        )
+    except Exception as exc:  # noqa: BLE001 - any failure here degrades, never raises
+        _logger.warning(
+            "OIDC discovery against %s failed (%s: %s) — local password login is "
+            "unaffected, but signing in via %s is unavailable until the next restart.",
+            oidc.discovery_url,
+            type(exc).__name__,
+            exc,
+            OIDC_PROVIDER_NAME,
+        )
+        return None
+
+    return fastapi_users.get_oauth_router(
+        client,
+        backend,
+        state_secret=state_secret,
+        # See OIDCSettings' docstring for why this is safe specifically for
+        # a self-hosted, operator-provisioned Authentik instance and not in
+        # general.
+        associate_by_email=True,
+        is_verified_by_default=oidc.is_verified_by_default,
     )
