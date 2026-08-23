@@ -36,6 +36,8 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
+from wk_auth.models import Role as _Role
+
 # `httpx_oauth.clients.openid.httpx` is the same module object as the
 # global `httpx` — `import httpx` binds a name, it doesn't copy the
 # module — so patching `...openid.httpx.Client` patches `httpx.Client`
@@ -69,9 +71,28 @@ class FakeAuthentik:
     """Answers discovery (sync) and token+userinfo (async) for one
     configured identity, like a real Authentik instance would."""
 
-    def __init__(self, *, sub: str = "authentik-sub-1", email: str = "ke@example.com"):
+    def __init__(
+        self,
+        *,
+        sub: str = "authentik-sub-1",
+        email: str = "ke@example.com",
+        groups: list[str] | None = None,
+        omit_groups_claim: bool = False,
+        userinfo_fails_after: int | None = None,
+    ):
         self.sub = sub
         self.email = email
+        # groups=None still sends the claim, as []: that is what Authentik
+        # does for a user in no groups, and it is a materially different
+        # case from the claim being absent (omit_groups_claim=True), which
+        # is what a provider missing its scope mapping looks like.
+        self.groups = groups if groups is not None else []
+        self.omit_groups_claim = omit_groups_claim
+        # Each SSO login hits userinfo twice: once for fastapi-users to read
+        # id+email, then again for the groups claim. Failing only the later
+        # calls isolates the role sync — killing userinfo outright fails the
+        # login itself, well before any of that runs.
+        self.userinfo_fails_after = userinfo_fails_after
         self.token_requests: list[httpx.Request] = []
         self.userinfo_requests: list[httpx.Request] = []
 
@@ -89,7 +110,15 @@ class FakeAuthentik:
             )
         if str(request.url) == DISCOVERY_DOC["userinfo_endpoint"]:
             self.userinfo_requests.append(request)
-            return httpx.Response(200, json={"sub": self.sub, "email": self.email})
+            if (
+                self.userinfo_fails_after is not None
+                and len(self.userinfo_requests) > self.userinfo_fails_after
+            ):
+                return httpx.Response(503)
+            claims = {"sub": self.sub, "email": self.email}
+            if not self.omit_groups_claim:
+                claims["groups"] = self.groups
+            return httpx.Response(200, json=claims)
         return httpx.Response(404, json={"error": "unhandled", "url": str(request.url)})
 
 
@@ -130,8 +159,50 @@ class OidcApp:
                 await session.execute(select(func.count()).select_from(self.user_model))
             ).scalar_one()
 
+    async def _user(self, session, email: str):
+        return (
+            await session.execute(select(self.user_model).where(self.user_model.email == email))
+        ).unique().scalar_one()
 
-async def make_oidc_app(*, discovery_url: str = DISCOVERY_URL, require_account_model: bool = True) -> OidcApp:
+    async def role_of(self, email: str) -> str:
+        async with self.session_maker() as session:
+            return (await self._user(session, email)).role.value
+
+    async def set_flags(self, email: str, *, role=None, is_superuser: bool | None = None) -> None:
+        """Put an account into a starting state a test needs — a second
+        admin to demote against, or the superuser exemption."""
+        async with self.session_maker() as session:
+            user = await self._user(session, email)
+            if role is not None:
+                user.role = role
+            if is_superuser is not None:
+                user.is_superuser = is_superuser
+            await session.commit()
+
+    async def add_admin(self, email: str) -> None:
+        """A second admin, so the last-admin guard is not what a demotion
+        test ends up measuring."""
+        from wk_auth.models import Role
+
+        async with self.session_maker() as session:
+            session.add(
+                self.user_model(
+                    email=email,
+                    hashed_password="x",
+                    is_active=True,
+                    is_verified=True,
+                    role=Role.ADMIN,
+                )
+            )
+            await session.commit()
+
+
+async def make_oidc_app(
+    *,
+    discovery_url: str = DISCOVERY_URL,
+    require_account_model: bool = True,
+    admin_group: str | None = None,
+) -> OidcApp:
     """Every call gets its own SQLite file and its own declarative Base —
     see the module docstring for why that isolation matters here."""
     from wk_auth import AccessTokenMixin, AuthSettings, OAuthAccountMixin, OAuthUserMixin, OIDCSettings, build_auth
@@ -165,7 +236,12 @@ async def make_oidc_app(*, discovery_url: str = DISCOVERY_URL, require_account_m
         get_async_session=get_async_session,
         settings=AuthSettings(secret_key="test-secret-key-not-for-production"),
         oauth_account_model=OAuthAccount if require_account_model else None,
-        oidc=OIDCSettings(client_id=CLIENT_ID, client_secret=CLIENT_SECRET, discovery_url=discovery_url),
+        oidc=OIDCSettings(
+            client_id=CLIENT_ID,
+            client_secret=CLIENT_SECRET,
+            discovery_url=discovery_url,
+            admin_group=admin_group,
+        ),
     )
 
     app = FastAPI()
@@ -430,3 +506,150 @@ async def test_both_login_routes_set_the_same_cookie_attributes():
         return name, sorted(p.strip().lower() for p in rest.split(";")[1:])
 
     assert attributes(password_res) == attributes(sso_res)
+
+
+# --- IdP groups decide who is an admin -------------------------------------
+#
+# The whole point is that access is managed in Authentik rather than in each
+# app's own user table. That cuts both ways: joining the group has to grant
+# admin, and leaving it has to take it away, or removing someone in Authentik
+# would quietly leave their rights here intact.
+
+
+async def test_membership_of_the_admin_group_promotes_on_login():
+    fake = FakeAuthentik(email="ke@example.com", groups=["birdex-users", "birdex-admins"])
+    with patched(fake):
+        oidc_app = await make_oidc_app(admin_group="birdex-admins")
+        async with AsyncClient(transport=ASGITransport(app=oidc_app.app), base_url="https://test") as client:
+            assert (await _run_sso_login(client, fake)).status_code == 303
+
+    assert await oidc_app.role_of("ke@example.com") == "admin"
+
+
+async def test_a_non_member_is_not_promoted():
+    fake = FakeAuthentik(email="ke@example.com", groups=["birdex-users"])
+    with patched(fake):
+        oidc_app = await make_oidc_app(admin_group="birdex-admins")
+        async with AsyncClient(transport=ASGITransport(app=oidc_app.app), base_url="https://test") as client:
+            assert (await _run_sso_login(client, fake)).status_code == 303
+
+    assert await oidc_app.role_of("ke@example.com") == "user"
+
+
+async def test_leaving_the_group_demotes_on_the_next_login():
+    """Revocation in Authentik has to actually reach the app, or the group
+    is only ever a one-way grant."""
+    fake = FakeAuthentik(email="ke@example.com", groups=["birdex-admins"])
+    with patched(fake):
+        oidc_app = await make_oidc_app(admin_group="birdex-admins")
+        async with AsyncClient(transport=ASGITransport(app=oidc_app.app), base_url="https://test") as client:
+            await _run_sso_login(client, fake)
+            assert await oidc_app.role_of("ke@example.com") == "admin"
+
+            # Someone else holds the role too, so the last-admin guard is
+            # not what this test is really exercising.
+            await oidc_app.add_admin("other-admin@example.com")
+
+            await client.post("/api/auth/logout")
+            fake.groups = ["birdex-users"]  # removed from the group upstream
+            await _run_sso_login(client, fake)
+
+    assert await oidc_app.role_of("ke@example.com") == "user"
+
+
+async def test_the_last_admin_is_never_demoted():
+    """An IdP misconfiguration must not be able to lock everyone out of the
+    admin UI — with no admin left there is no way back in through the app."""
+    fake = FakeAuthentik(email="ke@example.com", groups=["birdex-admins"])
+    with patched(fake):
+        oidc_app = await make_oidc_app(admin_group="birdex-admins")
+        async with AsyncClient(transport=ASGITransport(app=oidc_app.app), base_url="https://test") as client:
+            await _run_sso_login(client, fake)
+            assert await oidc_app.role_of("ke@example.com") == "admin"
+
+            await client.post("/api/auth/logout")
+            fake.groups = []  # e.g. the scope mapping was removed
+            await _run_sso_login(client, fake)
+
+    assert await oidc_app.role_of("ke@example.com") == "admin"
+
+
+async def test_a_superuser_is_never_demoted():
+    fake = FakeAuthentik(email="ke@example.com", groups=[])
+    with patched(fake):
+        oidc_app = await make_oidc_app(admin_group="birdex-admins")
+        async with AsyncClient(transport=ASGITransport(app=oidc_app.app), base_url="https://test") as client:
+            await client.post(
+                "/api/setup",
+                json={"email": "ke@example.com", "password": "hunter22", "display_name": "Ke"},
+            )
+            # A second admin, so it is the superuser exemption under test
+            # and not the last-admin one.
+            await oidc_app.add_admin("other-admin@example.com")
+            await _run_sso_login(client, fake)
+
+    assert await oidc_app.role_of("ke@example.com") == "admin"
+
+
+async def test_roles_are_untouched_when_no_admin_group_is_configured():
+    """Default behaviour has to stay exactly as it was: apps that never opt
+    in must not start having roles rewritten by whatever the IdP reports."""
+    fake = FakeAuthentik(email="ke@example.com", groups=["birdex-admins"])
+    with patched(fake):
+        oidc_app = await make_oidc_app()  # admin_group=None
+        async with AsyncClient(transport=ASGITransport(app=oidc_app.app), base_url="https://test") as client:
+            await _run_sso_login(client, fake)
+
+    assert await oidc_app.role_of("ke@example.com") == "user"
+
+
+async def test_a_missing_groups_claim_changes_nothing():
+    """A provider without the groups scope mapping reports no claim at all.
+    That is 'we could not ask', not 'this user is in no groups' — reading it
+    as the latter would demote every admin on their next login."""
+    fake = FakeAuthentik(email="ke@example.com", omit_groups_claim=True)
+    with patched(fake):
+        oidc_app = await make_oidc_app(admin_group="birdex-admins")
+        async with AsyncClient(transport=ASGITransport(app=oidc_app.app), base_url="https://test") as client:
+            await _run_sso_login(client, fake)
+            await oidc_app.set_flags("ke@example.com", role=_Role.ADMIN)
+            await oidc_app.add_admin("other-admin@example.com")
+            await client.post("/api/auth/logout")
+            await _run_sso_login(client, fake)
+
+    assert await oidc_app.role_of("ke@example.com") == "admin"
+
+
+async def test_an_unreadable_userinfo_endpoint_changes_nothing():
+    fake = FakeAuthentik(email="ke@example.com", groups=["birdex-admins"])
+    with patched(fake):
+        oidc_app = await make_oidc_app(admin_group="birdex-admins")
+        async with AsyncClient(transport=ASGITransport(app=oidc_app.app), base_url="https://test") as client:
+            await _run_sso_login(client, fake)
+            assert await oidc_app.role_of("ke@example.com") == "admin"
+            await oidc_app.add_admin("other-admin@example.com")
+
+            await client.post("/api/auth/logout")
+            # Let fastapi-users' own userinfo call through, break only the
+            # groups fetch that follows it.
+            fake.userinfo_requests.clear()
+            fake.userinfo_fails_after = 1
+            # The login itself must still succeed — a flaky groups lookup is
+            # no reason to lock someone out.
+            res = await _run_sso_login(client, fake)
+
+    assert res.status_code == 303
+    assert await oidc_app.role_of("ke@example.com") == "admin"
+
+
+async def test_the_admin_group_login_requests_the_profile_scope():
+    """The groups claim rides on `profile`, and httpx-oauth's default scopes
+    are only openid+email — without this the feature is silently inert."""
+    fake = FakeAuthentik()
+    with patched(fake):
+        oidc_app = await make_oidc_app(admin_group="birdex-admins")
+        async with AsyncClient(transport=ASGITransport(app=oidc_app.app), base_url="https://test") as client:
+            authorize = await client.get("/api/auth/authentik/authorize")
+
+    scope = httpx.URL(authorize.json()["authorization_url"]).params["scope"]
+    assert set(scope.split()) == {"openid", "email", "profile"}

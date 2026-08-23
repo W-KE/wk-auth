@@ -73,6 +73,20 @@ class OIDCSettings:
     # verification e-mail to add.
     is_verified_by_default: bool = True
 
+    # Name of the IdP group whose members get the admin role, e.g.
+    # "birdex-admins". Left None, OIDC never touches anyone's role and the
+    # only admin is whoever the first-run wizard created.
+    #
+    # Set it and the IdP becomes authoritative on *every* OIDC login:
+    # members are promoted, non-members are demoted. Demotion is the point
+    # — without it, removing someone from the group in Authentik would
+    # leave their admin rights here forever. Two accounts are exempt, both
+    # to keep a lockout from being one config typo away: superusers (the
+    # first-run account), and the last remaining admin.
+    admin_group: str | None = None
+    # Authentik ships groups in the `groups` claim of the profile scope.
+    groups_claim: str = "groups"
+
     def __post_init__(self) -> None:
         if not self.client_id or not self.client_secret:
             raise ValueError("OIDCSettings.client_id and .client_secret are required")

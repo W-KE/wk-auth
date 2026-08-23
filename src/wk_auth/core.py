@@ -241,6 +241,12 @@ def build_auth(
     if oidc is not None and oauth_account_model is None:
         raise ValueError("build_auth(oidc=...) also requires oauth_account_model")
 
+    # Built here rather than inside the router construction below because
+    # the user manager also needs it, to read the groups claim on each OIDC
+    # login. Discovery happens once, at startup; None means the IdP could
+    # not be reached, which disables SSO without touching password login.
+    oidc_client = _build_oidc_client(oidc) if oidc is not None else None
+
     async def get_user_db(
         session: AsyncSession = Depends(get_async_session),
     ) -> AsyncGenerator[Any, None]:
@@ -254,6 +260,55 @@ def build_auth(
     class UserManager(UUIDIDMixin, BaseUserManager[user_model, uuid.UUID]):  # type: ignore[valid-type]
         reset_password_token_secret = settings.secret_key
         verification_token_secret = settings.secret_key
+
+        async def oauth_callback(self, *args, **kwargs):
+            """Create/link the account as usual, then let the IdP's groups
+            decide whether it is an admin here."""
+            user = await super().oauth_callback(*args, **kwargs)
+            if oidc is None or oidc.admin_group is None or oidc_client is None:
+                return user
+            # fastapi-users calls this positionally: (oauth_name, access_token, ...)
+            access_token = kwargs.get("access_token") or (args[1] if len(args) > 1 else None)
+            if not access_token:  # pragma: no cover - signature guard
+                return user
+            groups = await _fetch_oidc_groups(oidc_client, oidc, access_token)
+            if groups is None:  # could not ask; leave the role alone
+                return user
+            return await self._sync_admin_role(user, oidc.admin_group in groups)
+
+        async def _sync_admin_role(self, user, should_be_admin: bool):
+            is_admin = user.role == Role.ADMIN
+            if is_admin == should_be_admin:
+                return user
+            if not should_be_admin:
+                # Two exemptions, both so that an IdP misconfiguration cannot
+                # lock everyone out of the admin UI: the first-run superuser,
+                # and whoever is currently the only admin left.
+                if user.is_superuser:
+                    return user
+                session = self.user_db.session
+                remaining = await session.scalar(
+                    select(func.count())
+                    .select_from(user_model)
+                    .where(user_model.role == Role.ADMIN, user_model.id != user.id)
+                )
+                if not remaining:
+                    _logger.warning(
+                        "%s is not in %r but is the last admin — keeping the role. "
+                        "Promote someone else first if this demotion is intended.",
+                        user.email,
+                        oidc.admin_group,
+                    )
+                    return user
+            _logger.info(
+                "%s %s via IdP group %r",
+                user.email,
+                "promoted to admin" if should_be_admin else "demoted to member",
+                oidc.admin_group,
+            )
+            return await self.user_db.update(
+                user, {"role": Role.ADMIN if should_be_admin else Role.USER}
+            )
 
     async def get_user_manager(user_db=Depends(get_user_db)) -> AsyncGenerator[UserManager, None]:
         yield UserManager(user_db)
@@ -282,7 +337,7 @@ def build_auth(
     )
 
     oidc_router = None
-    if oidc is not None:
+    if oidc is not None and oidc_client is not None:
         # A backend of its own, differing from the password one *only* in
         # what a successful login returns: a redirect rather than 204. It
         # shares the strategy, so both routes mint the same kind of session,
@@ -301,6 +356,7 @@ def build_auth(
         )
         oidc_router = _build_oidc_router(
             oidc=oidc,
+            client=oidc_client,
             backend=oidc_backend,
             fastapi_users=fastapi_users,
             state_secret=settings.secret_key,
@@ -325,14 +381,8 @@ def build_auth(
     )
 
 
-def _build_oidc_router(
-    *,
-    oidc: OIDCSettings,
-    backend: AuthenticationBackend,
-    fastapi_users: FastAPIUsers,
-    state_secret: str,
-) -> APIRouter | None:
-    """Discover the IdP and build its router — or, on any failure, log a
+def _build_oidc_client(oidc: OIDCSettings):
+    """Discover the IdP and build its client — or, on any failure, log a
     warning and return None. See build_auth()'s docstring for why a
     failure here must not raise.
     """
@@ -344,9 +394,17 @@ def _build_oidc_router(
             'pip install "wk-auth[oidc]"'
         ) from exc
 
+    # httpx-oauth defaults to ["openid", "email"]. `profile` is added
+    # because that is the scope Authentik ships the `groups` claim under,
+    # and without it admin_group could never match anything. Harmless when
+    # admin_group is unset — it costs one extra claim nobody reads.
     try:
         client = OpenID(
-            oidc.client_id, oidc.client_secret, oidc.discovery_url, name=OIDC_PROVIDER_NAME
+            oidc.client_id,
+            oidc.client_secret,
+            oidc.discovery_url,
+            name=OIDC_PROVIDER_NAME,
+            base_scopes=["openid", "email", "profile"],
         )
     except Exception as exc:  # noqa: BLE001 - any failure here degrades, never raises
         _logger.warning(
@@ -359,6 +417,17 @@ def _build_oidc_router(
         )
         return None
 
+    return client
+
+
+def _build_oidc_router(
+    *,
+    oidc: OIDCSettings,
+    client,
+    backend: AuthenticationBackend,
+    fastapi_users: FastAPIUsers,
+    state_secret: str,
+) -> APIRouter:
     return fastapi_users.get_oauth_router(
         client,
         backend,
@@ -369,3 +438,58 @@ def _build_oidc_router(
         associate_by_email=True,
         is_verified_by_default=oidc.is_verified_by_default,
     )
+
+
+async def _fetch_oidc_groups(client, oidc: OIDCSettings, access_token: str) -> list[str] | None:
+    """The groups the IdP reports for this token's subject, or None if they
+    could not be read.
+
+    fastapi-users' OAuth flow hands the user manager only an id and an
+    e-mail, so the claim has to be fetched from the userinfo endpoint
+    separately.
+
+    None and [] mean different things to the caller and must not be
+    collapsed: [] is "the IdP says this user is in no groups", which is
+    grounds to demote, while None is "we could not ask", which is grounds
+    to change nothing.
+    """
+    endpoint = (getattr(client, "openid_configuration", None) or {}).get("userinfo_endpoint")
+    if not endpoint:
+        _logger.warning(
+            "IdP discovery document has no userinfo_endpoint — the %r claim cannot "
+            "be read, so admin_group is inert.",
+            oidc.groups_claim,
+        )
+        return None
+
+    try:
+        # The oauth client's own http client, not a bare httpx.AsyncClient,
+        # so this call carries the same configuration as every other call
+        # httpx-oauth makes to the IdP.
+        async with client.get_httpx_client() as http:
+            response = await http.get(
+                endpoint, headers={"Authorization": f"Bearer {access_token}"}
+            )
+            response.raise_for_status()
+            claims = response.json()
+    except Exception as exc:  # noqa: BLE001 - a role sync must never fail a login
+        _logger.warning(
+            "Could not read %r from the IdP userinfo endpoint (%s: %s) — leaving "
+            "this user's role untouched.",
+            oidc.groups_claim,
+            type(exc).__name__,
+            exc,
+        )
+        return None
+
+    groups = claims.get(oidc.groups_claim)
+    if groups is None:
+        _logger.warning(
+            "IdP userinfo carried no %r claim. In Authentik that claim rides on "
+            "the 'profile' scope — check the provider's scope mappings.",
+            oidc.groups_claim,
+        )
+        return None
+    if isinstance(groups, str):  # some IdPs send a space-separated string
+        groups = groups.split()
+    return [str(g) for g in groups]
