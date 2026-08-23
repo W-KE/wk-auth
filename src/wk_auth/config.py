@@ -62,6 +62,12 @@ class OIDCSettings:
     client_secret: str
     # e.g. "https://auth.w-k.io/application/o/<app-slug>/.well-known/openid-configuration"
     discovery_url: str
+    # Where the browser lands after a successful SSO login. The IdP
+    # redirects the *browser* to the callback endpoint, so its response is
+    # what the user sees — without a redirect they end up on a blank page
+    # (fastapi-users answers a successful login with 204 No Content).
+    # Defaults to the app root, which for an SPA is the right place.
+    post_login_redirect: str = "/"
     # New accounts created via OIDC start verified: the IdP already
     # authenticated them, so there is nothing left for a local
     # verification e-mail to add.

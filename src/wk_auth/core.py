@@ -22,7 +22,8 @@ from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass
 from typing import Any
 
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, status
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Response, status
+from fastapi.responses import RedirectResponse
 from fastapi_users import BaseUserManager, FastAPIUsers, UUIDIDMixin
 from fastapi_users.authentication import AuthenticationBackend, CookieTransport
 from fastapi_users.authentication.strategy.db import AccessTokenDatabase, DatabaseStrategy
@@ -44,6 +45,33 @@ SessionDependency = Callable[..., AsyncGenerator[AsyncSession, None]]
 OIDC_PROVIDER_NAME = "authentik"
 
 _logger = logging.getLogger("wk_auth")
+
+
+class _RedirectCookieTransport(CookieTransport):
+    """A CookieTransport whose successful login is a redirect, not a 204.
+
+    Used only for the OIDC callback. The IdP redirects the *browser* to
+    that endpoint, so whatever it returns is what the user ends up looking
+    at — and fastapi-users' CookieTransport hardcodes 204 No Content,
+    which leaves them logged in but staring at a blank page at
+    /api/auth/authentik/callback.
+
+    Subclassing rather than post-processing keeps the cookie attributes
+    (name, domain, secure, samesite, max-age) identical to the password
+    login's, since `_set_login_cookie` is inherited untouched — the two
+    routes must produce the same session cookie or one of them silently
+    won't be honoured.
+    """
+
+    def __init__(self, *args, redirect_to: str, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.redirect_to = redirect_to
+
+    async def get_login_response(self, token: str) -> Response:
+        # 303: the callback arrives as a GET, and 303 tells the browser to
+        # follow with a GET too, without offering to re-submit anything.
+        response = RedirectResponse(self.redirect_to, status_code=status.HTTP_303_SEE_OTHER)
+        return self._set_login_cookie(response, token)
 
 
 @dataclass
@@ -255,9 +283,25 @@ def build_auth(
 
     oidc_router = None
     if oidc is not None:
+        # A backend of its own, differing from the password one *only* in
+        # what a successful login returns: a redirect rather than 204. It
+        # shares the strategy, so both routes mint the same kind of session,
+        # and inherits the cookie attributes, so both set the same cookie.
+        oidc_backend = AuthenticationBackend(
+            name="cookie",
+            transport=_RedirectCookieTransport(
+                cookie_name=settings.cookie_name,
+                cookie_max_age=settings.session_lifetime_seconds,
+                cookie_domain=settings.cookie_domain,
+                cookie_secure=settings.cookie_secure,
+                cookie_samesite=settings.cookie_samesite,
+                redirect_to=oidc.post_login_redirect,
+            ),
+            get_strategy=get_database_strategy,
+        )
         oidc_router = _build_oidc_router(
             oidc=oidc,
-            backend=backend,
+            backend=oidc_backend,
             fastapi_users=fastapi_users,
             state_secret=settings.secret_key,
         )

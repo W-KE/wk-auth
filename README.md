@@ -72,6 +72,8 @@ auth = build_auth(
 auth.include_routers(app)  # + mounts /api/auth/authentik/{authorize,callback}
 ```
 
+A successful SSO login answers with a **303 redirect** to `post_login_redirect` (default `/`), not the 204 that password login returns — the IdP redirects the *browser* to the callback, so its response is the page the user lands on, and a 204 would leave them logged in but staring at a blank screen. Both routes set an identical session cookie.
+
 Local login is never at the IdP's mercy: `OpenID.__init__` (httpx-oauth's own class, not something wired around here) does its discovery call **synchronously at construction time** — if that fails, `build_auth()` logs a warning and returns with `auth.oidc_router is None`, and the rest of the app — including local password login and the setup wizard — boots exactly as if `oidc=` had been omitted. There's no retry; the next process restart tries discovery again. `tests/test_oidc.py` asserts this directly (an unreachable IdP still lets local login work end to end).
 
 A successful Authentik login is linked to an existing local account by e-mail match (`associate_by_email=True`, not exposed as configurable — see `OIDCSettings`' docstring for why that's safe specifically for a self-hosted, operator-provisioned IdP with no public registration, and stops being safe the moment that changes).
@@ -99,7 +101,7 @@ Not published to PyPI. Apps depend on it by git URL, **pinned to a tag**:
 
 ```toml
 dependencies = [
-    "wk-auth[oidc] @ git+https://github.com/W-KE/wk-auth@v0.2.0",
+    "wk-auth[oidc] @ git+https://github.com/W-KE/wk-auth@v0.3.0",
 ]
 ```
 

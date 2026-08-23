@@ -262,7 +262,11 @@ async def test_a_new_identity_creates_an_account_and_logs_in():
         oidc_app = await make_oidc_app()
         async with AsyncClient(transport=ASGITransport(app=oidc_app.app), base_url="https://test") as client:
             res = await _run_sso_login(client, fake)
-            assert res.status_code == 204, res.text
+            # 303, not 204: the IdP redirects the browser here, so the
+            # response is what the user sees. The session cookie has to
+            # ride along with the redirect or they arrive logged out.
+            assert res.status_code == 303, res.text
+            assert res.headers["location"] == "/"
             assert "wk_session" in client.cookies
 
             me = await client.get("/api/users/me")
@@ -288,7 +292,7 @@ async def test_oidc_login_links_to_an_existing_local_password_account():
             original_id = setup.json()["id"]
 
             res = await _run_sso_login(client, fake)
-            assert res.status_code == 204, res.text
+            assert res.status_code == 303, res.text
 
             me = await client.get("/api/users/me")
             assert me.json()["id"] == original_id  # same account, not a new one
@@ -378,3 +382,51 @@ async def test_login_methods_needs_no_authentication():
         async with AsyncClient(transport=ASGITransport(app=oidc_app.app), base_url="https://test") as client:
             # No cookie, no setup completed, nothing.
             assert (await client.get("/api/auth/methods")).status_code == 200
+
+
+async def test_password_login_still_answers_204_not_a_redirect():
+    """The redirect transport is scoped to the OIDC callback only. The SPA
+    posts the password form with fetch() and expects a plain 204 — turning
+    that into a redirect would have it follow one and mistake the result
+    for a login failure."""
+    fake = FakeAuthentik(email="ke@example.com")
+    with patched(fake):
+        oidc_app = await make_oidc_app()
+        async with AsyncClient(transport=ASGITransport(app=oidc_app.app), base_url="https://test") as client:
+            await client.post(
+                "/api/setup",
+                json={"email": "ke@example.com", "password": "hunter22", "display_name": "Ke"},
+            )
+            res = await client.post(
+                "/api/auth/login", data={"username": "ke@example.com", "password": "hunter22"}
+            )
+
+    assert res.status_code == 204
+    assert "location" not in res.headers
+
+
+async def test_both_login_routes_set_the_same_cookie_attributes():
+    """Password login and SSO must mint the same session cookie — a
+    mismatch in name, path or samesite means one of them silently isn't
+    honoured on the next request."""
+    fake = FakeAuthentik(email="ke@example.com")
+    with patched(fake):
+        oidc_app = await make_oidc_app()
+        async with AsyncClient(transport=ASGITransport(app=oidc_app.app), base_url="https://test") as client:
+            await client.post(
+                "/api/setup",
+                json={"email": "ke@example.com", "password": "hunter22", "display_name": "Ke"},
+            )
+            password_res = await client.post(
+                "/api/auth/login", data={"username": "ke@example.com", "password": "hunter22"}
+            )
+            await client.post("/api/auth/logout")
+            sso_res = await _run_sso_login(client, fake)
+
+    def attributes(response):
+        raw = response.headers["set-cookie"]
+        # Drop the token value itself; compare only the attributes.
+        name, _, rest = raw.partition("=")
+        return name, sorted(p.strip().lower() for p in rest.split(";")[1:])
+
+    assert attributes(password_res) == attributes(sso_res)
