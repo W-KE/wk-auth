@@ -76,8 +76,35 @@ class OIDCSettings:
     def __post_init__(self) -> None:
         if not self.client_id or not self.client_secret:
             raise ValueError("OIDCSettings.client_id and .client_secret are required")
-        if not self.discovery_url.startswith("https://"):
+        if not _is_https_or_loopback(self.discovery_url):
+            # A malformed URL is a typo in your own config, so it's raised
+            # rather than degraded — unlike an IdP that's merely
+            # unreachable, which build_auth() survives. The distinction is
+            # deliberate: an outage is transient and shouldn't take local
+            # password login down with it, while a typo needs fixing and
+            # would otherwise sit silently disabled.
             raise ValueError(
-                "OIDCSettings.discovery_url must be https:// — "
-                f"got {self.discovery_url!r}"
+                "OIDCSettings.discovery_url must be https:// (http:// is "
+                "allowed only for loopback addresses during local "
+                f"development) — got {self.discovery_url!r}"
             )
+
+
+# Plain http would put the client_secret and the authorization code on the
+# wire in clear, so it's refused — except on loopback, where the traffic
+# never leaves the machine and requiring TLS would mean nobody can
+# exercise the SSO flow locally without provisioning certificates.
+_LOOPBACK_PREFIXES = (
+    "http://127.0.0.1",
+    "http://[::1]",
+    "http://localhost",
+)
+
+
+def _is_https_or_loopback(url: str) -> bool:
+    if url.startswith("https://"):
+        return True
+    return any(
+        url == prefix or url.startswith(prefix + "/") or url.startswith(prefix + ":")
+        for prefix in _LOOPBACK_PREFIXES
+    )

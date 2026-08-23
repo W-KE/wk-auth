@@ -101,7 +101,7 @@ Not published to PyPI. Apps depend on it by git URL, **pinned to a tag**:
 
 ```toml
 dependencies = [
-    "wk-auth[oidc] @ git+https://github.com/W-KE/wk-auth@v0.3.0",
+    "wk-auth[oidc] @ git+https://github.com/W-KE/wk-auth@v0.4.0",
 ]
 ```
 
