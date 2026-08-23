@@ -1,6 +1,6 @@
 [project]
 name = "wk-auth"
-version = "0.1.0"
+version = "0.2.0"
 description = "Shared authentication for self-hosted w-k.io apps"
 requires-python = ">=3.11"
 dependencies = [

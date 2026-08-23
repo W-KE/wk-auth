@@ -11,6 +11,7 @@ Each app keeps its own database, its own `Base`, its own routers. This package s
 - `build_auth(...)` — wires cookie-session auth (fastapi-users, DB-backed strategy) plus a self-locking first-run setup wizard
 - `SecretBox` — Fernet encryption for secrets an app stores in its own DB (e.g. an Immich API key)
 - `OAuthUserMixin` / `OAuthAccountMixin` / `OIDCSettings` — "log in with Authentik" alongside local password login (needs the `oidc` extra: `pip install "wk-auth[oidc]"`)
+- `GET {prefix}/auth/methods` — mounted automatically; tells a login page which methods to offer, so it can draw an SSO button only when SSO actually works
 
 ## Wiring it into an app
 
@@ -98,7 +99,7 @@ Not published to PyPI. Apps depend on it by git URL, **pinned to a tag**:
 
 ```toml
 dependencies = [
-    "wk-auth[oidc] @ git+https://github.com/W-KE/wk-auth@v0.1.0",
+    "wk-auth[oidc] @ git+https://github.com/W-KE/wk-auth@v0.2.0",
 ]
 ```
 

@@ -48,6 +48,7 @@ from wk_auth.config import DEFAULT_SESSION_LIFETIME, AuthSettings, OIDCSettings
 from wk_auth.core import Auth, build_auth
 from wk_auth.models import AccessTokenMixin, OAuthAccountMixin, OAuthUserMixin, Role, UserMixin
 from wk_auth.schemas import (
+    LoginMethods,
     SetRoleRequest,
     SetupStatus,
     UserCreate,
@@ -64,6 +65,7 @@ __all__ = [
     "Auth",
     "AuthSettings",
     "DEFAULT_SESSION_LIFETIME",
+    "LoginMethods",
     "OAuthAccountMixin",
     "OAuthUserMixin",
     "OIDCSettings",

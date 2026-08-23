@@ -325,3 +325,56 @@ async def test_no_duplicate_account_is_created_on_a_second_sso_login():
             await _run_sso_login(client, fake)
 
     assert await oidc_app.user_count() == 1
+
+
+# --- what the login page is told ------------------------------------------
+
+
+async def test_login_methods_advertises_oidc_when_it_is_available():
+    """The login page has no other way to know whether to draw an SSO
+    button — it's read before anyone is signed in."""
+    fake = FakeAuthentik()
+    with patched(fake):
+        oidc_app = await make_oidc_app()
+        async with AsyncClient(transport=ASGITransport(app=oidc_app.app), base_url="https://test") as client:
+            body = (await client.get("/api/auth/methods")).json()
+
+    assert body["password"] is True
+    assert body["oidc"] is True
+    assert body["oidc_name"] == "Authentik"
+    assert body["oidc_authorize_url"] == "/api/auth/authentik/authorize"
+
+
+async def test_login_methods_hides_oidc_when_the_idp_was_unreachable():
+    """The case that matters: OIDC *is* configured, but discovery failed at
+    startup so the route isn't mounted. Advertising it would give the login
+    page a button that 404s — for exactly the users who now depend on the
+    password form."""
+
+    def always_down(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    with patch(
+        "httpx_oauth.clients.openid.httpx.Client",
+        lambda: _RealClient(transport=httpx.MockTransport(always_down)),
+    ):
+        oidc_app = await make_oidc_app()
+
+    async with AsyncClient(transport=ASGITransport(app=oidc_app.app), base_url="https://test") as client:
+        body = (await client.get("/api/auth/methods")).json()
+        # …and the advertised state matches reality.
+        assert (await client.get("/api/auth/authentik/authorize")).status_code == 404
+
+    assert body["password"] is True
+    assert body["oidc"] is False
+    assert body["oidc_name"] is None
+    assert body["oidc_authorize_url"] is None
+
+
+async def test_login_methods_needs_no_authentication():
+    fake = FakeAuthentik()
+    with patched(fake):
+        oidc_app = await make_oidc_app()
+        async with AsyncClient(transport=ASGITransport(app=oidc_app.app), base_url="https://test") as client:
+            # No cookie, no setup completed, nothing.
+            assert (await client.get("/api/auth/methods")).status_code == 200

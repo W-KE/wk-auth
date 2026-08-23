@@ -33,7 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from wk_auth.config import AuthSettings, OIDCSettings
 from wk_auth.models import Role
-from wk_auth.schemas import SetupStatus, UserCreate, UserRead, UserUpdate
+from wk_auth.schemas import LoginMethods, SetupStatus, UserCreate, UserRead, UserUpdate
 from wk_auth.secrets import SecretBox
 
 SessionDependency = Callable[..., AsyncGenerator[AsyncSession, None]]
@@ -122,6 +122,20 @@ class Auth:
                 self.oidc_router,
                 prefix=f"{prefix}/auth/{OIDC_PROVIDER_NAME}",
                 tags=["auth"],
+            )
+
+        oidc_on = self.oidc_router is not None
+        authorize_url = f"{prefix}/auth/{OIDC_PROVIDER_NAME}/authorize" if oidc_on else None
+
+        @app.get(f"{prefix}/auth/methods", response_model=LoginMethods, tags=["auth"])
+        async def login_methods() -> LoginMethods:
+            """What the login page should offer. Unauthenticated by
+            necessity — it is read before anyone can be signed in."""
+            return LoginMethods(
+                password=True,
+                oidc=oidc_on,
+                oidc_name=OIDC_PROVIDER_NAME.title() if oidc_on else None,
+                oidc_authorize_url=authorize_url,
             )
 
 
