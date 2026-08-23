@@ -94,12 +94,30 @@ pytest
 
 ## Versioning
 
-Not yet published anywhere — apps pin it via a local path or a git dependency:
+Not published to PyPI. Apps depend on it by git URL, **pinned to a tag**:
 
 ```toml
 dependencies = [
-    "wk-auth @ git+https://github.com/W-KE/wk-auth@main",
+    "wk-auth[oidc] @ git+https://github.com/W-KE/wk-auth@v0.1.0",
 ]
 ```
 
-No stability promises yet; both consumers (libra, birdex) are maintained by the same person who maintains this package, so a breaking change here is made together with the call sites that need updating.
+Pinned rather than tracking `@master`, so that rebuilding an app image a
+month from now produces the same `wk_auth` it did today. With `@master`
+an app's image content depends on when it happened to be built, which
+makes "worked yesterday, broken today" impossible to attribute.
+
+### Cutting a release
+
+1. Bump `version` in `pyproject.toml`.
+2. Commit, then `git tag vX.Y.Z && git push origin master --tags`.
+3. Bump the tag in each consumer's `pyproject.toml` (`birdex`, `libra`)
+   and reinstall — `pip install -e .` won't re-resolve a git URL that
+   hasn't changed, so a *new* tag is what makes consumers pick it up.
+
+Consumers stay on their pinned tag until step 3, which is the point: a
+change here can't silently reach a running app.
+
+No stability promises yet; both consumers are maintained by the same
+person who maintains this package, so a breaking change here is made
+together with the call sites that need updating.
